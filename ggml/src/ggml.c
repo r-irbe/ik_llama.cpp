@@ -500,6 +500,25 @@ bool ggml_guid_matches(ggml_guid_t guid_a, ggml_guid_t guid_b) {
 // timing
 //
 
+static void ggml_cpu_profile_dump(void);
+static bool ggml_cpu_profile = false;
+static const char * ggml_cpu_profile_path = NULL;
+
+static void ggml_cpu_profile_init(void) {
+    static bool is_first_call = true;
+    if (is_first_call) {
+        is_first_call = false;
+        const char * env = getenv("GGML_CPU_PROFILE");
+        if (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) {
+            ggml_cpu_profile = true;
+            if (strcmp(env, "1") != 0) {
+                ggml_cpu_profile_path = env;
+            }
+            atexit(ggml_cpu_profile_dump);
+        }
+    }
+}
+
 #if defined(_MSC_VER) || defined(__MINGW32__)
 static int64_t timer_freq, timer_start;
 void ggml_time_init(void) {
@@ -512,6 +531,7 @@ void ggml_time_init(void) {
     // We subtract the program start time to reduce the likelihood of that happening.
     QueryPerformanceCounter(&t);
     timer_start = t.QuadPart;
+    ggml_cpu_profile_init();
 }
 int64_t ggml_time_ms(void) {
     LARGE_INTEGER t;
@@ -524,7 +544,9 @@ int64_t ggml_time_us(void) {
     return ((t.QuadPart-timer_start) * 1000000) / timer_freq;
 }
 #else
-void ggml_time_init(void) {}
+void ggml_time_init(void) {
+    ggml_cpu_profile_init();
+}
 int64_t ggml_time_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -2927,6 +2949,8 @@ struct ggml_context_container {
     struct ggml_context context;
 };
 
+#define GGML_MAX_THREADS 512
+
 struct ggml_compute_state_shared {
     const struct ggml_cgraph * cgraph;
     const struct ggml_cplan * cplan;
@@ -2944,6 +2968,11 @@ struct ggml_compute_state_shared {
     atomic_int current_chunk; // currently processing chunk during mul_mat, shared between all the threads
 
     enum ggml_status ec;
+
+    // per-node profiling scratch, parity-indexed so thread 0 can fold one
+    // node while the team writes the next (see GGML_CPU_PROFILE)
+    int64_t prof_work[GGML_MAX_THREADS][2];
+    int64_t prof_fin[GGML_MAX_THREADS][2];
 };
 
 struct ggml_compute_state {
@@ -18407,9 +18436,23 @@ static int ggml_compute_forward_mul_mat(
     //   Also, chunking by thread was measured to have perform better on NUMA systems.  See https://github.com/ggerganov/llama.cpp/pull/6915
     //   In theory, chunking should be just as useful on NUMA and non NUMA systems, but testing disagreed with that.
     if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
+        int nth_eff = nth;
+        if (nr1 == 1) {
+            const int64_t work = nr0 * nb01;
+            nth_eff = (int) MIN((int64_t) nth, MAX((int64_t) 1, work / (64*1024)));
+        }
         // distribute the thread work across the inner or outer loop based on which one is larger
-        nchunk0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
-        nchunk1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
+        nchunk0 = nr0 > nr1 ? nth_eff : 1; // parallelize by src0 rows
+        nchunk1 = nr0 > nr1 ? 1 : nth_eff; // parallelize by src1 rows
+    }
+
+    int64_t line_elems = nr1 == 1 ? 64 / MAX(1, (int64_t) ggml_type_size(dst->type)) : 1;
+    if (nr0 < nchunk0 * line_elems) {
+        if (nb01 >= 16*1024) {
+            line_elems = 1;
+        } else {
+            nchunk0 = MAX((int64_t) 1, nr0 / line_elems);
+        }
     }
 
     // The number of elements in each chunk
@@ -18445,8 +18488,12 @@ static int ggml_compute_forward_mul_mat(
         const int64_t ith0 = current_chunk % nchunk0;
         const int64_t ith1 = current_chunk / nchunk0;
 
-        const int64_t ir0_start = dr0 * ith0;
-        const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
+        int64_t ir0_start = dr0 * ith0;
+        int64_t ir0_end   = MIN(ir0_start + dr0, nr0);
+        if (line_elems > 1) {
+            ir0_start = (ith0 * nr0 / nchunk0) / line_elems * line_elems;
+            ir0_end   = ith0 + 1 == nchunk0 ? nr0 : ((ith0 + 1) * nr0 / nchunk0) / line_elems * line_elems;
+        }
 
         const int64_t ir1_start = dr1 * ith1;
         const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
@@ -19979,6 +20026,30 @@ static void ggml_compute_forward_get_rows_q(
     }
 }
 
+struct ggml_thread_tile {
+    int64_t ir0, ir1; // row range
+    int64_t ic0, ic1; // column range
+};
+
+static inline struct ggml_thread_tile ggml_get_thread_tile(
+        const struct ggml_compute_params * params,
+        int64_t nr, int64_t nc, int64_t min_cols) {
+    const int64_t ith = params->ith;
+    const int64_t nth = params->nth;
+
+    if (nr >= nth || nc < 2*min_cols) {
+        const int64_t dr  = (nr + nth - 1)/nth;
+        const int64_t ir0 = MIN(dr*ith, nr);
+        struct ggml_thread_tile tile = { ir0, MIN(ir0 + dr, nr), 0, nc };
+        return tile;
+    }
+
+    const int64_t dc  = GGML_PAD(MAX((nc + nth - 1)/nth, min_cols), 64);
+    const int64_t ic0 = MIN(dc*ith, nc);
+    struct ggml_thread_tile tile = { 0, nr, ic0, MIN(ic0 + dc, nc) };
+    return tile;
+}
+
 static void ggml_compute_forward_get_rows_f16(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -19996,30 +20067,24 @@ static void ggml_compute_forward_get_rows_f16(
     assert(nb00 == sizeof(ggml_fp16_t));
     assert(ggml_nrows(dst) == nr);
 
-    const int ith = params->ith;
-    const int nth = params->nth;
+    const struct ggml_thread_tile tile = ggml_get_thread_tile(params, nr, nc, 1024);
+    const int64_t tc = tile.ic1 - tile.ic0;
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    if (tc > 0) {
+        for (int64_t i = tile.ir0; i < tile.ir1; ++i) {
+            const int64_t i12 = i/(ne11*ne10);
+            const int64_t i11 = (i - i12*ne11*ne10)/ne10;
+            const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+            const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    for (int64_t i = ir0; i < ir1; ++i) {
-        const int64_t i12 = i/(ne11*ne10);
-        const int64_t i11 = (i - i12*ne11*ne10)/ne10;
-        const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
-        const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
-
-        if (i01 >= 0 && i01 < ne01) {
-            ggml_fp16_to_fp32_row(
-                    (const void *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
-                         (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
-        } else {
-            memset((char *) dst->data + i10*nb1  + i11*nb2  + i12*nb3, 0, nc*sizeof(float));
+            if (i01 >= 0 && i01 < ne01) {
+                ggml_fp16_to_fp32_row(
+                        (const void *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03 + tile.ic0*sizeof(ggml_fp16_t)),
+                             (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3  + tile.ic0*sizeof(float)), tc);
+            } else {
+                memset((char *) dst->data + i10*nb1  + i11*nb2  + i12*nb3 + tile.ic0*sizeof(float), 0, tc*sizeof(float));
+            }
         }
-
     }
 }
 
@@ -20040,28 +20105,23 @@ static void ggml_compute_forward_get_rows_bf16(
     assert(nb00 == sizeof(ggml_bf16_t));
     assert(ggml_nrows(dst) == nr);
 
-    const int ith = params->ith;
-    const int nth = params->nth;
+    const struct ggml_thread_tile tile = ggml_get_thread_tile(params, nr, nc, 1024);
+    const int64_t tc = tile.ic1 - tile.ic0;
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    if (tc > 0) {
+        for (int64_t i = tile.ir0; i < tile.ir1; ++i) {
+            const int64_t i12 = i/(ne11*ne10);
+            const int64_t i11 = (i - i12*ne11*ne10)/ne10;
+            const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+            const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    for (int64_t i = ir0; i < ir1; ++i) {
-        const int64_t i12 = i/(ne11*ne10);
-        const int64_t i11 = (i - i12*ne11*ne10)/ne10;
-        const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
-        const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
-
-        if (i01 >= 0 && i01 < ne01) {
-            ggml_bf16_to_fp32_row(
-                    (const void *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
-                         (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
-        } else {
-            memset((char *) dst->data + i10*nb1  + i11*nb2  + i12*nb3, 0, nc*sizeof(float));
+            if (i01 >= 0 && i01 < ne01) {
+                ggml_bf16_to_fp32_row(
+                        (const void *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03 + tile.ic0*sizeof(ggml_bf16_t)),
+                             (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3  + tile.ic0*sizeof(float)), tc);
+            } else {
+                memset((char *) dst->data + i10*nb1  + i11*nb2  + i12*nb3 + tile.ic0*sizeof(float), 0, tc*sizeof(float));
+            }
         }
     }
 }
@@ -20083,28 +20143,23 @@ static void ggml_compute_forward_get_rows_f32(
     assert(nb00 == sizeof(float));
     assert(ggml_nrows(dst) == nr);
 
-    const int ith = params->ith;
-    const int nth = params->nth;
+    const struct ggml_thread_tile tile = ggml_get_thread_tile(params, nr, nc, 1024);
+    const int64_t tc = tile.ic1 - tile.ic0;
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    if (tc > 0) {
+        for (int64_t i = tile.ir0; i < tile.ir1; ++i) {
+            const int64_t i12 = i/(ne11*ne10);
+            const int64_t i11 = (i - i12*ne11*ne10)/ne10;
+            const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+            const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    for (int64_t i = ir0; i < ir1; ++i) {
-        const int64_t i12 = i/(ne11*ne10);
-        const int64_t i11 = (i - i12*ne11*ne10)/ne10;
-        const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
-        const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
-
-        if (i01 >= 0 && i01 < ne01) {
-            ggml_vec_cpy_f32(nc,
-                    (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3),
-                    (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03));
-        } else {
-            memset((char *)dst->data + i10*nb1  + i11*nb2  + i12*nb3, 0, nc*sizeof(float));
+            if (i01 >= 0 && i01 < ne01) {
+                ggml_vec_cpy_f32(tc,
+                        (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3  + tile.ic0*sizeof(float)),
+                        (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03 + tile.ic0*sizeof(float)));
+            } else {
+                memset((char *)dst->data + i10*nb1  + i11*nb2  + i12*nb3 + tile.ic0*sizeof(float), 0, tc*sizeof(float));
+            }
         }
     }
 }
@@ -29387,6 +29442,164 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
     return cplan;
 }
 
+struct ggml_cpu_profile_entry {
+    enum ggml_op   op;
+    int32_t        subop;      // unary/glu op, -1 otherwise
+    enum ggml_type src0_type;  // GGML_TYPE_COUNT when there is no src0
+    int64_t        src0_ne[3];
+    int64_t        n_cols;     // dst ne[1]
+    bool           fused;
+
+    int64_t count;
+    int64_t wall_us;  // critical path: dispatch on thread 0 -> after the barrier
+    int64_t work_us;  // per-thread compute time, summed over the threads
+    int64_t tail_us;  // barrier exit time after the slowest thread finished
+    int64_t thr_us;   // wall_us * n_threads, accumulated per fold
+};
+
+#define GGML_CPU_PROFILE_MAX_ENTRIES 1024
+
+static struct ggml_cpu_profile_entry ggml_cpu_profile_table[GGML_CPU_PROFILE_MAX_ENTRIES];
+static int64_t ggml_cpu_profile_dropped = 0;
+
+static void ggml_cpu_profile_fold(
+        const struct ggml_compute_state_shared * shared,
+        const struct ggml_tensor     * node,
+        bool fused, int64_t t0, int64_t t_bar, int nth, int slot) {
+    int64_t work    = 0;
+    int64_t max_fin = 0;
+    int count_th = MIN(nth, GGML_MAX_THREADS);
+    for (int i = 0; i < count_th; i++) {
+        work += shared->prof_work[i][slot];
+        if (shared->prof_fin[i][slot] > max_fin) {
+            max_fin = shared->prof_fin[i][slot];
+        }
+    }
+
+    struct ggml_cpu_profile_entry key;
+    memset(&key, 0, sizeof(key));
+    key.op        = node->op;
+    key.subop     = node->op == GGML_OP_UNARY ? (int32_t) ggml_get_unary_op(node) :
+                    node->op == GGML_OP_GLU   ? (int32_t) ggml_get_glu_op(node)   : -1;
+    key.src0_type = node->src[0] ? node->src[0]->type : GGML_TYPE_COUNT;
+    if (node->src[0]) {
+        key.src0_ne[0] = node->src[0]->ne[0];
+        key.src0_ne[1] = node->src[0]->ne[1];
+        key.src0_ne[2] = node->src[0]->ne[2];
+    }
+    key.n_cols = node->ne[1];
+    key.fused  = fused;
+
+    const size_t key_size = offsetof(struct ggml_cpu_profile_entry, count);
+
+    // FNV-1a over the key bytes
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < key_size; i++) {
+        h = (h ^ ((const uint8_t *) &key)[i]) * 0x100000001b3ULL;
+    }
+
+    ggml_critical_section_start();
+    for (size_t probe = 0; probe < GGML_CPU_PROFILE_MAX_ENTRIES; probe++) {
+        struct ggml_cpu_profile_entry * e =
+            &ggml_cpu_profile_table[(h + probe) % GGML_CPU_PROFILE_MAX_ENTRIES];
+        if (e->count == 0) {
+            memcpy(e, &key, key_size);
+        } else if (memcmp(e, &key, key_size) != 0) {
+            continue;
+        }
+        e->count   += 1;
+        e->wall_us += t_bar - t0;
+        e->work_us += work;
+        e->tail_us += t_bar - max_fin;
+        e->thr_us  += (t_bar - t0) * nth;
+        ggml_critical_section_end();
+        return;
+    }
+    ggml_cpu_profile_dropped++;
+    ggml_critical_section_end();
+}
+
+static int ggml_cpu_profile_cmp(const void * a, const void * b) {
+    const struct ggml_cpu_profile_entry * ea = *(const struct ggml_cpu_profile_entry * const *) a;
+    const struct ggml_cpu_profile_entry * eb = *(const struct ggml_cpu_profile_entry * const *) b;
+    return ea->wall_us < eb->wall_us ? 1 : ea->wall_us > eb->wall_us ? -1 : 0;
+}
+
+static void ggml_cpu_profile_dump(void) {
+    FILE * f = stderr;
+    if (ggml_cpu_profile_path) {
+        f = fopen(ggml_cpu_profile_path, "w");
+        if (!f) {
+            f = stderr;
+        }
+    }
+
+    const struct ggml_cpu_profile_entry * entries[GGML_CPU_PROFILE_MAX_ENTRIES];
+    int n_entries = 0;
+
+    int64_t tot_wall = 0;
+    int64_t tot_work = 0;
+    int64_t tot_thr  = 0;
+    int64_t tot_tail = 0;
+    for (int i = 0; i < GGML_CPU_PROFILE_MAX_ENTRIES; i++) {
+        const struct ggml_cpu_profile_entry * e = &ggml_cpu_profile_table[i];
+        if (e->count > 0) {
+            entries[n_entries++] = e;
+            tot_wall += e->wall_us;
+            tot_work += e->work_us;
+            tot_thr  += e->thr_us;
+            tot_tail += e->tail_us;
+        }
+    }
+    qsort(entries, n_entries, sizeof(entries[0]), ggml_cpu_profile_cmp);
+
+    fprintf(f, "\n== ggml cpu profile ==\n");
+    fprintf(f, "total: %.1f ms across the nodes, thread utilization %.1f%%, barrier tail %.1f%%\n",
+            tot_wall / 1e3,
+            tot_thr  > 0 ? 100.0 * tot_work / tot_thr  : 0.0,
+            tot_wall > 0 ? 100.0 * tot_tail / tot_wall : 0.0);
+    if (ggml_cpu_profile_dropped > 0) {
+        fprintf(f, "warning: %" PRId64 " node executions not attributed (profile table full)\n",
+                ggml_cpu_profile_dropped);
+    }
+    fprintf(f, "%-24s %-8s %-22s %6s %10s %6s %9s %6s %6s\n",
+            "op", "type", "src0 x cols", "count", "total ms", "%", "avg us", "util%", "tail%");
+    for (int i = 0; i < n_entries; i++) {
+        const struct ggml_cpu_profile_entry * e = entries[i];
+
+        char name[64];
+        snprintf(name, sizeof(name), "%s%s%s%s", ggml_op_name(e->op),
+                 e->subop < 0             ? "" : "/",
+                 e->subop < 0             ? "" :
+                 e->op == GGML_OP_UNARY   ? ggml_unary_op_name((enum ggml_unary_op) e->subop) :
+                                            ggml_glu_op_name((enum ggml_glu_op) e->subop),
+                 e->fused ? "+fused" : "");
+
+        char shape[64];
+        if (e->src0_type == GGML_TYPE_COUNT) {
+            snprintf(shape, sizeof(shape), "- x %" PRId64, e->n_cols);
+        } else {
+            snprintf(shape, sizeof(shape), "%" PRId64 "x%" PRId64 "x%" PRId64 " x %" PRId64,
+                     e->src0_ne[0], e->src0_ne[1], e->src0_ne[2], e->n_cols);
+        }
+
+        fprintf(f, "%-24s %-8s %-22s %6" PRId64 " %10.1f %6.2f %9.1f %6.1f %6.1f\n",
+                name,
+                e->src0_type == GGML_TYPE_COUNT ? "-" : ggml_type_name(e->src0_type),
+                shape,
+                e->count,
+                e->wall_us / 1e3,
+                tot_wall   > 0 ? 100.0 * e->wall_us / tot_wall   : 0.0,
+                (double) e->wall_us / e->count,
+                e->thr_us  > 0 ? 100.0 * e->work_us / e->thr_us  : 0.0,
+                e->wall_us > 0 ? 100.0 * e->tail_us / e->wall_us : 0.0);
+    }
+
+    if (f != stderr) {
+        fclose(f);
+    }
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
 
@@ -29403,6 +29616,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.shared=*/ state->shared,
     };
 
+    const bool prof = ggml_cpu_profile;
+    int  prof_slot    = 0;
+    bool prof_pending = false;
+    int64_t prof_t0   = 0;
+    const struct ggml_tensor * prof_node = NULL;
+
 #if IK_PRINT_TIMING
     int64_t t_start = ggml_time_us();
     int64_t t_eval  = 0;
@@ -29413,6 +29632,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if (ggml_is_noop(node)) continue;
 
+        if (prof) {
+            prof_t0 = ggml_time_us();
+        }
+
 #if IK_PRINT_TIMING
         int64_t tim1 = ggml_time_us();
 #endif
@@ -29422,11 +29645,29 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         t_eval += tim2 - tim1;
 #endif
 
+        if (prof) {
+            const int64_t fin = ggml_time_us();
+            if (state->ith < GGML_MAX_THREADS) {
+                state->shared->prof_work[state->ith][prof_slot] = fin - prof_t0;
+                state->shared->prof_fin[state->ith][prof_slot]  = fin;
+            }
+            prof_node    = node;
+            prof_pending = true;
+        }
+
         if (state->ith == 0 && cplan->abort_callback && cplan->abort_callback(cplan->abort_callback_data)) {
             state->shared->ec = GGML_STATUS_ABORTED;
         }
 
         ggml_barrier(state->shared);
+
+        if (prof && prof_pending) {
+            if (state->ith == 0) {
+                ggml_cpu_profile_fold(state->shared, prof_node, false, prof_t0, ggml_time_us(), params.nth, prof_slot);
+            }
+            prof_slot ^= 1;
+            prof_pending = false;
+        }
 
         if (state->shared->ec != GGML_STATUS_SUCCESS) {
             break;

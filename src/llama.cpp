@@ -31,6 +31,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpu-numa.h"
 
 #include <cmath>
 
@@ -448,6 +449,9 @@ static size_t llama_get_device_count(const llama_model & model, int initial_coun
 #elif defined(GGML_USE_CANN)
     return ggml_backend_cann_get_device_count();
 #endif
+    if (ggml::cpu::numa::is_numa_split()) {
+        count += ggml::cpu::numa::topology().size();
+    }
 #if defined(GGML_USE_RPC)
     count += model.rpc_servers.size();
 #endif
@@ -468,17 +472,42 @@ static ggml_backend_buffer_type_t llama_default_buffer_type_offload(const llama_
         return ggml_backend_rpc_buffer_type(endpoint, rpc.device);
     }
 #endif
-#if defined(GGML_USE_METAL)
-    buft = ggml_backend_metal_buffer_type();
-#elif defined(GGML_USE_CUDA)
-    buft = ggml_backend_cuda_buffer_type(gpu);
-#elif defined(GGML_USE_VULKAN)
-    buft = ggml_backend_vk_buffer_type(gpu);
+
+    int gpu_count = 0;
+#if defined(GGML_USE_CUDA)
+    gpu_count = (int) ggml_backend_cuda_get_device_count();
+    if (gpu < gpu_count) {
+        return ggml_backend_cuda_buffer_type(gpu);
+    }
 #elif defined(GGML_USE_SYCL)
-    buft = ggml_backend_sycl_buffer_type(gpu);
+    gpu_count = (int) ggml_backend_sycl_get_device_count();
+    if (gpu < gpu_count) {
+        return ggml_backend_sycl_buffer_type(gpu);
+    }
+#elif defined(GGML_USE_VULKAN)
+    gpu_count = (int) ggml_backend_vk_get_device_count();
+    if (gpu < gpu_count) {
+        return ggml_backend_vk_buffer_type(gpu);
+    }
 #elif defined(GGML_USE_CANN)
-    buft = ggml_backend_cann_buffer_type(gpu);
+    gpu_count = (int) ggml_backend_cann_get_device_count();
+    if (gpu < gpu_count) {
+        return ggml_backend_cann_buffer_type(gpu);
+    }
+#elif defined(GGML_USE_METAL)
+    gpu_count = 1;
+    if (gpu < gpu_count) {
+        return ggml_backend_metal_buffer_type();
+    }
 #endif
+
+    if (ggml::cpu::numa::is_numa_split()) {
+        int numa_idx = gpu - gpu_count;
+        const auto & topo = ggml::cpu::numa::topology();
+        if (numa_idx >= 0 && numa_idx < (int) topo.size()) {
+            return ggml_backend_cpu_numa_buffer_type(topo[numa_idx].id);
+        }
+    }
 
     if (buft == nullptr) {
         buft = llama_default_buffer_type_cpu(true);
@@ -531,29 +560,56 @@ static size_t llama_get_device_memory(const llama_model & model, int device) {
         return free;
     }
 #endif
+    int gpu_count = 0;
 #if defined(GGML_USE_CUDA)
-    size_t total;
-    size_t free;
-    ggml_backend_cuda_get_device_memory(device, &free, &total);
-    return free;
+    gpu_count = (int) ggml_backend_cuda_get_device_count();
+    if (device < gpu_count) {
+        size_t total;
+        size_t free;
+        ggml_backend_cuda_get_device_memory(device, &free, &total);
+        return free;
+    }
 #elif defined(GGML_USE_SYCL)
-    size_t total;
-    size_t free;
-    ggml_backend_sycl_get_device_memory(device, &free, &total);
-    return free;
+    gpu_count = (int) ggml_backend_sycl_get_device_count();
+    if (device < gpu_count) {
+        size_t total;
+        size_t free;
+        ggml_backend_sycl_get_device_memory(device, &free, &total);
+        return free;
+    }
 #elif defined(GGML_USE_VULKAN)
-    size_t total;
-    size_t free;
-    ggml_backend_vk_get_device_memory(device, &free, &total);
-    return free;
+    gpu_count = (int) ggml_backend_vk_get_device_count();
+    if (device < gpu_count) {
+        size_t total;
+        size_t free;
+        ggml_backend_vk_get_device_memory(device, &free, &total);
+        return free;
+    }
 #elif defined(GGML_USE_CANN)
-    size_t total;
-    size_t free;
-    ggml_backend_cann_get_device_memory(device, &free, &total);
-    return free;
-#else
-    return 1;
+    gpu_count = (int) ggml_backend_cann_get_device_count();
+    if (device < gpu_count) {
+        size_t total;
+        size_t free;
+        ggml_backend_cann_get_device_memory(device, &free, &total);
+        return free;
+    }
+#elif defined(GGML_USE_METAL)
+    gpu_count = 1;
+    if (device < gpu_count) {
+        return 1;
+    }
 #endif
+
+    if (ggml::cpu::numa::is_numa_split()) {
+        int numa_idx = device - gpu_count;
+        const auto & topo = ggml::cpu::numa::topology();
+        if (numa_idx >= 0 && numa_idx < (int) topo.size()) {
+            return topo[numa_idx].mem_available;
+        }
+        return 0;
+    }
+
+    return 1;
     GGML_UNUSED(model);
     GGML_UNUSED(device);
 }
@@ -6933,10 +6989,12 @@ static void llama_graph_compute(
     }
 #endif
 
-    if (lctx.backend_cpu != nullptr) {
-        ggml_backend_cpu_set_n_threads(lctx.backend_cpu, n_threads);
-        ggml_backend_cpu_set_abort_callback(lctx.backend_cpu, lctx.abort_callback, lctx.abort_callback_data);
-        ggml_backend_cpu_set_moe_expert_prefetch(lctx.backend_cpu, lctx.cparams.prefetch_experts);
+    for (auto * backend : lctx.backends) {
+        if (ggml_backend_is_cpu(backend)) {
+            ggml_backend_cpu_set_n_threads(backend, n_threads);
+            ggml_backend_cpu_set_abort_callback(backend, lctx.abort_callback, lctx.abort_callback_data);
+            ggml_backend_cpu_set_moe_expert_prefetch(backend, lctx.cparams.prefetch_experts);
+        }
     }
 
     ggml_backend_sched_graph_compute_async(lctx.sched, gf);
@@ -6955,10 +7013,12 @@ static void llama_graph_compute_sched(
     }
 #endif
 
-    if (lctx.backend_cpu != nullptr) {
-        ggml_backend_cpu_set_n_threads(lctx.backend_cpu, n_threads);
-        ggml_backend_cpu_set_abort_callback(lctx.backend_cpu, lctx.abort_callback, lctx.abort_callback_data);
-        ggml_backend_cpu_set_moe_expert_prefetch(lctx.backend_cpu, lctx.cparams.prefetch_experts);
+    for (auto * backend : lctx.backends) {
+        if (ggml_backend_is_cpu(backend)) {
+            ggml_backend_cpu_set_n_threads(backend, n_threads);
+            ggml_backend_cpu_set_abort_callback(backend, lctx.abort_callback, lctx.abort_callback_data);
+            ggml_backend_cpu_set_moe_expert_prefetch(backend, lctx.cparams.prefetch_experts);
+        }
     }
 
     ggml_backend_sched_graph_compute_async(sched, gf);
@@ -8683,9 +8743,31 @@ void llama_backend_init(void) {
     }
 }
 
+enum llama_numa_init_status llama_numa_init_ex(enum ggml_numa_strategy numa) {
+    if (numa == GGML_NUMA_STRATEGY_DISABLED) {
+        return LLAMA_NUMA_INIT_STATUS_SUCCESS;
+    }
+
+    if (numa == GGML_NUMA_STRATEGY_SPLIT) {
+        const auto & topo = ggml::cpu::numa::topology();
+        if (topo.size() < 2) {
+            LLAMA_LOG_WARN("%s: --numa split requires at least 2 usable NUMA nodes (found %zu), continuing without NUMA optimizations\n",
+                    __func__, topo.size());
+            return LLAMA_NUMA_INIT_STATUS_UNAVAILABLE;
+        }
+
+        ggml::cpu::numa::set_numa_split(true);
+        LLAMA_LOG_INFO("%s: NUMA split initialized with %zu nodes\n", __func__, topo.size());
+        return LLAMA_NUMA_INIT_STATUS_SUCCESS;
+    }
+
+    ggml_numa_init(numa);
+    return LLAMA_NUMA_INIT_STATUS_SUCCESS;
+}
+
 void llama_numa_init(enum ggml_numa_strategy numa) {
-    if (numa != GGML_NUMA_STRATEGY_DISABLED) {
-        ggml_numa_init(numa);
+    if (llama_numa_init_ex(numa) == LLAMA_NUMA_INIT_STATUS_FAILED) {
+        GGML_ABORT("llama_numa_init: failed to initialize the requested NUMA strategy");
     }
 }
 
@@ -9456,6 +9538,19 @@ struct llama_context * llama_init_from_model(
             ctx->backends = std::move(backends);
         }
 
+        if (ggml::cpu::numa::is_numa_split()) {
+            const auto & topo = ggml::cpu::numa::topology();
+            for (size_t i = 0; i < topo.size(); ++i) {
+                ggml_backend_t numa_backend = ggml_backend_cpu_numa_init(topo[i].id);
+                if (numa_backend == nullptr) {
+                    LLAMA_LOG_ERROR("%s: failed to initialize CPU NUMA node %d backend\n", __func__, topo[i].id);
+                    llama_free(ctx);
+                    return nullptr;
+                }
+                ctx->backends.push_back(numa_backend);
+            }
+        }
+
         ctx->backend_cpu = ggml_backend_cpu_init();
         if (ctx->backend_cpu == nullptr) {
             LLAMA_LOG_ERROR("%s: failed to initialize CPU backend\n", __func__);
@@ -9585,7 +9680,10 @@ struct llama_context * llama_init_from_model(
             // buffer types used for the compute buffer of each backend
             std::vector<ggml_backend_buffer_type_t> backend_buft;
             for (auto * backend : ctx->backends) {
-                if (ggml_backend_is_cpu(backend)) {
+                if (ggml_backend_is_cpu_numa(backend)) {
+                    int node_id = ggml_backend_cpu_numa_get_node(backend);
+                    backend_buft.push_back(ggml_backend_cpu_numa_buffer_type(node_id));
+                } else if (ggml_backend_is_cpu(backend)) {
                     // use host buffers for the CPU backend compute buffer
                     backend_buft.push_back(llama_default_buffer_type_cpu(true));
                 } else {
@@ -9613,6 +9711,9 @@ struct llama_context * llama_init_from_model(
             // currently this is only implemented in the CUDA backend
             pipeline_parallel = false;
 #endif
+            if (ggml::cpu::numa::is_numa_split()) {
+                pipeline_parallel = false;
+            }
             ctx->sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, pipeline_parallel);
 
             if (pipeline_parallel) {

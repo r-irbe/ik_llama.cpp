@@ -114,6 +114,15 @@ extern "C" {
     GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_hbm_buffer_type(void);
 #endif
 
+    // NUMA CPU backend
+    GGML_API int                        ggml_backend_cpu_numa_node_count(void);
+    GGML_API ggml_backend_t             ggml_backend_cpu_numa_init(int node_id);
+    GGML_API bool                       ggml_backend_is_cpu_numa(ggml_backend_t backend);
+    GGML_API int                        ggml_backend_cpu_numa_get_node(ggml_backend_t backend);
+    GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_numa_buffer_type(int node_id);
+    GGML_API void                       ggml_backend_cpu_numa_get_memory(int node_id, size_t * free, size_t * total);
+
+
     //
     // Backend registry
     //
