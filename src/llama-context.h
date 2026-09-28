@@ -116,8 +116,15 @@ struct llama_kv_cache {
     uint32_t  window_swa   = 0;
     uint32_t  head_swa     = 0;
     llama_pos pos_base_swa = 0;
+    std::vector<uint32_t>  heads_swa;
+    std::vector<llama_pos> pos_bases_swa;
 
-    uint32_t live_swa() const { return head_swa - sink_rows; }
+    uint32_t live_swa(uint32_t seq_id = 0) const {
+        if (seq_id < heads_swa.size()) {
+            return heads_swa[seq_id] - sink_rows;
+        }
+        return head_swa - sink_rows;
+    }
 
     // computed before each graph build
     uint32_t n = 0;

@@ -550,7 +550,7 @@ static inline uint32_t llama_swa_compact_rows(uint32_t window, uint32_t pad, uin
 }
 
 static inline uint32_t llama_kv_layer_rows(const llama_hparams & hparams, int il, uint32_t kv_size,
-                                           bool swa_compress, uint32_t n_ubatch, uint32_t pad) {
+                                           bool swa_compress, uint32_t n_ubatch, uint32_t pad, uint32_t n_seq_max = 1) {
     if (!swa_compress || il < 0 || il >= (int) hparams.n_layer) {
         return kv_size;
     }
@@ -561,5 +561,6 @@ static inline uint32_t llama_kv_layer_rows(const llama_hparams & hparams, int il
         return kv_size;
     }
     const uint32_t rows = llama_swa_compact_rows(hparams.n_swa, pad, n_ubatch, hparams.param_sink_number);
-    return rows < kv_size ? rows : kv_size;
+    const uint32_t total_rows = rows * std::max<uint32_t>(1, n_seq_max);
+    return total_rows < kv_size ? total_rows : kv_size;
 }

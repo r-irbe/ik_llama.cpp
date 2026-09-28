@@ -181,7 +181,41 @@ static size_t page_size() {
     return size;
 }
 
+static size_t detect_hugepage_size() {
+    static size_t hpsz = 0;
+    if (hpsz == 0) {
+        std::string val;
+        if (read_file("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size", val)) {
+            try {
+                hpsz = std::stoull(val);
+            } catch (...) {
+                hpsz = 0;
+            }
+        }
+        if (hpsz == 0) {
+            hpsz = 2u * 1024u * 1024u; // 2MB fallback
+        }
+    }
+    return hpsz;
+}
+
+static size_t get_node_free_hugepages(int node_id, size_t page_size_kb) {
+    std::string path = "/sys/devices/system/node/node" + std::to_string(node_id) +
+                       "/hugepages/hugepages-" + std::to_string(page_size_kb) + "kB/free_hugepages";
+    std::string content;
+    if (read_file(path, content)) {
+        try {
+            return std::stoull(content);
+        } catch (...) {}
+    }
+    return 0;
+}
+
 static size_t page_align(size_t size) {
+    const size_t hpsz = detect_hugepage_size();
+    if (size >= hpsz) {
+        return (size + hpsz - 1) & ~(hpsz - 1);
+    }
     const size_t ps = page_size();
     return (size + ps - 1) & ~(ps - 1);
 }
@@ -293,10 +327,62 @@ void * alloc_onnode(size_t size, int node_id, std::string & error) {
         return nullptr;
     }
 
-    void * addr = mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (addr == MAP_FAILED) {
-        error = std::string("mmap failed: ") + strerror(errno);
-        return nullptr;
+    void * addr = nullptr;
+    const size_t hpsz = detect_hugepage_size();
+    constexpr size_t GIGAPAGE_SIZE = 1024u * 1024u * 1024u;
+
+#if defined(MAP_HUGETLB) && defined(MAP_HUGE_1GB)
+    // Attempt 1 GB hugetlbfs allocation if available and requested
+    if (len >= GIGAPAGE_SIZE && (len % GIGAPAGE_SIZE == 0) &&
+        get_node_free_hugepages(node_id, 1048576) >= (len / GIGAPAGE_SIZE)) {
+        void * h1g_addr = mmap(nullptr, len, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_1GB, -1, 0);
+        if (h1g_addr != MAP_FAILED) {
+            addr = h1g_addr;
+        }
+    }
+#endif
+
+#if defined(MAP_HUGETLB) && defined(MAP_HUGE_2MB)
+    // Attempt 2 MB hugetlbfs allocation if available
+    if (!addr && len >= hpsz && (len % hpsz == 0) &&
+        get_node_free_hugepages(node_id, hpsz / 1024) >= (len / hpsz)) {
+        void * h2m_addr = mmap(nullptr, len, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
+        if (h2m_addr != MAP_FAILED) {
+            addr = h2m_addr;
+        }
+    }
+#endif
+
+    // Fallback: 2MB-aligned anonymous mmap with transparent hugepage advice
+    if (!addr) {
+        if (len >= hpsz) {
+            const size_t raw_len = len + hpsz;
+            void * raw_addr = mmap(nullptr, raw_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (raw_addr == MAP_FAILED) {
+                error = std::string("mmap failed: ") + strerror(errno);
+                return nullptr;
+            }
+            uintptr_t uaddr = (uintptr_t) raw_addr;
+            uintptr_t aligned_uaddr = (uaddr + hpsz - 1) & ~(hpsz - 1);
+            size_t prefix = (size_t)(aligned_uaddr - uaddr);
+            size_t suffix = hpsz - prefix;
+
+            if (prefix > 0) {
+                munmap(raw_addr, prefix);
+            }
+            if (suffix > 0) {
+                munmap((void *)(aligned_uaddr + len), suffix);
+            }
+            addr = (void *) aligned_uaddr;
+        } else {
+            addr = mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (addr == MAP_FAILED) {
+                error = std::string("mmap failed: ") + strerror(errno);
+                return nullptr;
+            }
+        }
     }
 
     // bind before the first fault, the policy is applied when the pages are allocated
@@ -357,6 +443,31 @@ bool bind_current_thread(const std::vector<int> & cpus) {
     return sched_setaffinity(0, sizeof(set), &set) == 0;
 }
 
+bool bind_current_thread_to_node(int node_id, int thread_idx) {
+    const auto & nodes = topology();
+    for (const auto & n : nodes) {
+        if (n.id == node_id) {
+            if (n.cpus.empty()) return false;
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            if (thread_idx >= 0) {
+                int target_cpu = n.cpus[thread_idx % n.cpus.size()];
+                if (target_cpu >= 0 && target_cpu < CPU_SETSIZE) {
+                    CPU_SET(target_cpu, &set);
+                }
+            } else {
+                for (int cpu : n.cpus) {
+                    if (cpu >= 0 && cpu < CPU_SETSIZE) {
+                        CPU_SET(cpu, &set);
+                    }
+                }
+            }
+            return sched_setaffinity(0, sizeof(set), &set) == 0;
+        }
+    }
+    return false;
+}
+
 static std::vector<int> process_cpu_mask() {
     cpu_set_t set;
     CPU_ZERO(&set);
@@ -410,6 +521,24 @@ bool bind_current_thread(const std::vector<int> & cpus) {
     (void) cpus;
 }
 
+bool bind_current_thread_to_node(int node_id, int thread_idx) {
+    (void) node_id;
+    (void) thread_idx;
+    return false;
+}
+
 #endif
 
 } // namespace ggml::cpu::numa
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+bool ggml_cpu_numa_bind_current_thread(int node_id, int thread_idx) {
+    return ggml::cpu::numa::bind_current_thread_to_node(node_id, thread_idx);
+}
+
+#ifdef __cplusplus
+}
+#endif

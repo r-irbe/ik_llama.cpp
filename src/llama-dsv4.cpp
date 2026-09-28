@@ -385,15 +385,20 @@ static bool dsv4_build_raw_context(
     // compacted layers address raw K rows through [sinks | window] geometry rather than by cell
     const bool compacted = kv.any_compacted();
     if (compacted) {
-        if (kv.head_swa + (uint32_t) batch.n_tokens > kv.size_swa) {
+        const llama_seq_id first_seq = (batch.seq_id && batch.n_tokens > 0 && batch.seq_id[0]) ? batch.seq_id[0][0] : 0;
+        const uint32_t cur_head = (first_seq >= 0 && (size_t) first_seq < kv.heads_swa.size())
+            ? kv.heads_swa[first_seq] : kv.head_swa;
+        const llama_pos cur_base = (first_seq >= 0 && (size_t) first_seq < kv.pos_bases_swa.size())
+            ? kv.pos_bases_swa[first_seq] : kv.pos_base_swa;
+        if (cur_head + (uint32_t) batch.n_tokens > kv.size_swa) {
             LLAMA_LOG_ERROR("%s: DSV4 compacted raw write rows [%u, %u) are outside size_swa %u\n",
-                    __func__, kv.head_swa, kv.head_swa + (uint32_t) batch.n_tokens, kv.size_swa);
+                    __func__, cur_head, cur_head + (uint32_t) batch.n_tokens, kv.size_swa);
             return false;
         }
         if (batch.pos != nullptr && batch.n_tokens > 0 &&
-            kv.pos_base_swa + (llama_pos) (kv.head_swa - kv.sink_rows) != batch.pos[0]) {
+            cur_base + (llama_pos) (cur_head - kv.sink_rows) != batch.pos[0]) {
             LLAMA_LOG_ERROR("%s: DSV4 compacted write row %u disagrees with batch position %d (base %d)\n",
-                    __func__, kv.head_swa, batch.pos[0], kv.pos_base_swa);
+                    __func__, cur_head, batch.pos[0], cur_base);
             return false;
         }
     }
@@ -410,7 +415,12 @@ static bool dsv4_build_raw_context(
         }
 
         raw.write_src_idxs.push_back(i);
-        raw.write_dst_idxs.push_back(compacted ? (int32_t) kv.head_swa + i : slot);
+        const llama_seq_id seq_id = (batch.seq_id && batch.seq_id[i]) ? batch.seq_id[i][0] : 0;
+        const uint32_t cur_head = (seq_id >= 0 && (size_t) seq_id < kv.heads_swa.size())
+            ? kv.heads_swa[seq_id] : kv.head_swa;
+        const uint32_t seq_offset = (seq_id >= 0 && (size_t) seq_id < kv.heads_swa.size())
+            ? (uint32_t) seq_id * kv.size_swa : 0;
+        raw.write_dst_idxs.push_back(compacted ? (int32_t) (seq_offset + cur_head + i) : slot);
     }
 
     raw.n_kv = 0;
@@ -418,6 +428,10 @@ static bool dsv4_build_raw_context(
     for (size_t s = 0; s < raw.sinfo_read.n_stream(); ++s) {
         const llama_seq_id seq_id = read_seq_ids[s];
         raw.sinfo_read.idxs[s].clear();
+        const llama_pos cur_base = (seq_id >= 0 && (size_t) seq_id < kv.pos_bases_swa.size())
+            ? kv.pos_bases_swa[seq_id] : kv.pos_base_swa;
+        const uint32_t seq_offset = (seq_id >= 0 && (size_t) seq_id < kv.heads_swa.size())
+            ? (uint32_t) seq_id * kv.size_swa : 0;
         int32_t count = 0;
         for (uint32_t slot = 0; slot < kv.size; ++slot) {
             const llama_kv_cell & cell = kv.cells[slot];
@@ -427,12 +441,12 @@ static bool dsv4_build_raw_context(
             if (!cell.has_seq_id(seq_id)) {
                 continue;
             }
-            if (compacted && cell.pos < kv.pos_base_swa) {
+            if (compacted && cell.pos < cur_base) {
                 // rows before the window base were overwritten by compaction
                 continue;
             }
             const uint32_t row = compacted
-                ? kv.sink_rows + (uint32_t) (cell.pos - kv.pos_base_swa) : slot;
+                ? seq_offset + kv.sink_rows + (uint32_t) (cell.pos - cur_base) : slot;
             raw.sinfo_read.idxs[s].push_back(row);
             raw.read_dst_idxs.push_back((int32_t) row);
             ++count;

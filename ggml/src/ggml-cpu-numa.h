@@ -1,5 +1,6 @@
 #pragma once
 
+#ifdef __cplusplus
 #include <cstddef>
 #include <string>
 #include <vector>
@@ -44,9 +45,25 @@ int page_node(const void * addr);
 
 // pin the calling thread to the given CPUs, best effort
 bool bind_current_thread(const std::vector<int> & cpus);
+bool bind_current_thread_to_node(int node_id, int thread_idx);
 
 // whether numa split is enabled
 bool is_numa_split();
 void set_numa_split(bool enable);
 
 } // namespace ggml::cpu::numa
+#else
+#include <stdbool.h>
+#include <stddef.h>
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// C-compatible wrapper for binding the current thread during graph compute
+bool ggml_cpu_numa_bind_current_thread(int node_id, int thread_idx);
+
+#ifdef __cplusplus
+}
+#endif

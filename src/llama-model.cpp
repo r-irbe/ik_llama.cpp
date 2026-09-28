@@ -2851,7 +2851,7 @@ size_t llama_model::cache_size(int il, ggml_type type_k, ggml_type type_v, ggml_
         const int64_t n_indexer_head = hparams.indexer_head_size;
 
         const uint32_t raw_pad = llama_kv_cache::get_padding(flash_attn);
-        const uint32_t k_rows = llama_kv_layer_rows(hparams, il, kv_size, swa_compress, n_ubatch, raw_pad);
+        const uint32_t k_rows = llama_kv_layer_rows(hparams, il, kv_size, swa_compress, n_ubatch, raw_pad, n_seq_max);
         size_t size = ggml_row_size(type_k, n_embd_head) * hparams.n_head_kv(il) * k_rows;
         if (hparams.dsv4_shared_streams) {
             // readers alias their source, so only sources and key owners cost anything here
@@ -2879,7 +2879,7 @@ size_t llama_model::cache_size(int il, ggml_type type_k, ggml_type type_v, ggml_
 
     auto n_head_kv = hparams.n_head_kv(il);
     const uint32_t rows = llama_kv_layer_rows(hparams, il, kv_size, swa_compress && supports_swa_compress(), n_ubatch,
-                                              llama_kv_cache::get_padding(flash_attn));
+                                              llama_kv_cache::get_padding(flash_attn), n_seq_max);
     auto k_size = ggml_row_size(type_k, hparams.n_embd_head_k(il)) * n_head_kv*rows;
     auto v_size = ggml_row_size(type_v, hparams.n_embd_v_gqa(il)) * rows;
     // a qwen4exp sparse-attention layer also caches one raw indexer key per cell and one

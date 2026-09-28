@@ -271,7 +271,7 @@ create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_mod
     if (ml.tensor_buft_overrides) {
         for (const auto * o = ml.tensor_buft_overrides; o->pattern != nullptr; ++o) {
             auto buft = o->buft;
-            if (ggml_backend_buft_is_host(buft)) buft = default_cpu_buft;
+            if (ggml_backend_buft_is_host(buft) && !ggml_backend_buft_is_cpu_numa(buft)) buft = default_cpu_buft;
             overrides.emplace_back(std::make_pair(std::regex(o->pattern), buft));
         }
     }
@@ -471,7 +471,7 @@ static std::vector<int> create_split(int nr, int granularity, const std::vector<
 ggml_context * create_tensors_helper::get_context_for_tensor(ggml_context * ctx, const std::string & name) {
     for (auto & o : overrides) {
         if (std::regex_search(name, o.first)) {
-            if (o.second == default_cpu_buft) has_buft_overrides = true;
+            if (o.second == default_cpu_buft || ggml_backend_buft_is_cpu_numa(o.second)) has_buft_overrides = true;
             const struct ggml_tensor * cur = ml.get_tensor_meta(name.c_str());
             const size_t nbytes = cur ? ggml_nbytes(cur) : 0;
             LLAMA_LOG_INFO("Tensor %s (size = %.2f MiB) buffer type overridden to %s\n", name.c_str(), nbytes/1024./1024., ggml_backend_buft_name(o.second));

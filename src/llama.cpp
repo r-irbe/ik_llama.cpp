@@ -1287,7 +1287,7 @@ static bool llama_kv_cache_init(
         bool any = false;
         for (int il = 0; il < (int) hparams.n_layer; ++il) {
             plan[il] = llama_kv_layer_rows(hparams, il, kv_size, true, cparams.n_ubatch,
-                                           llama_kv_cache::get_padding(cparams.flash_attn));
+                                           llama_kv_cache::get_padding(cparams.flash_attn), cparams.n_seq_max);
             any = any || plan[il] < kv_size;
         }
         if (any) {
@@ -1301,11 +1301,14 @@ static bool llama_kv_cache_init(
                         "compacted sliding-window layers must share one row count");
                 rows_compacted = cache.row_count[il];
             }
-            cache.size_swa     = rows_compacted;
+            const uint32_t n_seq = std::max<uint32_t>(1, cparams.n_seq_max);
+            cache.size_swa     = rows_compacted / n_seq;
             cache.sink_rows    = hparams.param_sink_number;
             cache.window_swa   = hparams.n_swa;
             cache.head_swa     = cache.sink_rows;
             cache.pos_base_swa = 0;
+            cache.heads_swa.assign(n_seq, cache.sink_rows);
+            cache.pos_bases_swa.assign(n_seq, 0);
         } else {
             if (model.supports_dflash_swa_compress()) {
                 LLAMA_LOG_INFO("%s: --swa-compress uses the DFlash custom cache, ordinary KV bookkeeping has no compactable layers\n", __func__);
@@ -2709,6 +2712,10 @@ static bool llama_kv_cache_seq_rm(
     if (compact_apply) {
         cache.head_swa     = compact_head;
         cache.pos_base_swa = compact_base;
+        if (seq_id >= 0 && (size_t) seq_id < cache.heads_swa.size()) {
+            cache.heads_swa[seq_id]     = compact_head;
+            cache.pos_bases_swa[seq_id] = compact_base;
+        }
     }
 
     return true;
@@ -7524,6 +7531,13 @@ static int llama_decode_internal(
             if (kv_self.any_compacted()) {
                 kv_self.head_swa += n_tokens;
                 GGML_ASSERT(kv_self.head_swa <= kv_self.size_swa);
+                if (u_batch.seq_id && u_batch.n_tokens > 0 && u_batch.seq_id[0]) {
+                    const llama_seq_id seq_id = u_batch.seq_id[0][0];
+                    if (seq_id >= 0 && (size_t) seq_id < kv_self.heads_swa.size()) {
+                        kv_self.heads_swa[seq_id] += n_tokens;
+                        GGML_ASSERT(kv_self.heads_swa[seq_id] <= kv_self.size_swa);
+                    }
+                }
             }
 
             // Ensure kv cache head points to a valid index.
@@ -9567,8 +9581,8 @@ struct llama_context * llama_init_from_model(
             return nullptr;
         }
 
-        if (params.n_seq_max > 1 && ctx->kv_self.any_compacted()) {
-            LLAMA_LOG_ERROR("%s: --swa-compress supports a single sequence only (requested n_seq_max = %u); run with -np 1\n",
+        if (params.n_seq_max > 1 && ctx->kv_self.any_compacted() && !llm_arch_is_dsv4(model->arch)) {
+            LLAMA_LOG_ERROR("%s: --swa-compress supports a single sequence only for this architecture (requested n_seq_max = %u); run with -np 1\n",
                     __func__, params.n_seq_max);
             llama_free(ctx);
             return nullptr;

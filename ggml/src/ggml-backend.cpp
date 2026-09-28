@@ -21,6 +21,7 @@
 #include <condition_variable>
 #include <unordered_map>
 #include <memory>
+#include <functional>
 #include "ggml-cpu-numa.h"
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
@@ -888,6 +889,12 @@ ggml_backend_buffer_type_t ggml_backend_cpu_numa_buffer_type(int node_id) {
     return res;
 }
 
+bool ggml_backend_buft_is_cpu_numa(ggml_backend_buffer_type_t buft) {
+    if (!buft) return false;
+    return buft->iface.get_name == ggml_backend_cpu_numa_buffer_type_get_name;
+}
+
+
 
 #ifdef GGML_USE_CPU_HBM
 
@@ -1176,7 +1183,11 @@ static void ggml_backend_cpu_numa_free(ggml_backend_t backend) {
     if (ctx->worker_thread.joinable()) {
         ctx->worker_thread.join();
     }
-    free(ctx->work_data);
+    if (ctx->work_data) {
+        ggml::cpu::numa::free_onnode(ctx->work_data, ctx->work_size);
+        ctx->work_data = nullptr;
+        ctx->work_size = 0;
+    }
     delete ctx;
     free(backend);
 }
@@ -1201,9 +1212,16 @@ static void ggml_backend_cpu_numa_worker_loop(struct ggml_backend_cpu_numa_conte
         }
 
         struct ggml_cplan cplan = ggml_graph_plan(cgraph, ctx->n_threads);
+        cplan.numa_node = ctx->node_id;
+
         if (ctx->work_size < cplan.work_size) {
-            free(ctx->work_data);
-            ctx->work_data = malloc(cplan.work_size);
+            if (ctx->work_data) {
+                ggml::cpu::numa::free_onnode(ctx->work_data, ctx->work_size);
+                ctx->work_data = nullptr;
+                ctx->work_size = 0;
+            }
+            std::string err;
+            ctx->work_data = ggml::cpu::numa::alloc_onnode(cplan.work_size, ctx->node_id, err);
             if (ctx->work_data == nullptr) {
                 ctx->work_size = 0;
                 std::lock_guard<std::mutex> lock(ctx->mutex);
@@ -1587,8 +1605,12 @@ struct ggml_backend_sched {
 
     uint32_t op_offload[(GGML_OP_COUNT + 31)/32];
 
+    struct alignas(128) backend_status_padded {
+        enum ggml_status status = GGML_STATUS_SUCCESS;
+    };
+
     std::vector<std::thread> workers;
-    std::vector<ggml_status> statuses;
+    std::vector<backend_status_padded> statuses;
     std::vector<std::vector<ggml_backend_sched_split*>> backend_splits;
     std::array<bool, GGML_SCHED_MAX_BACKENDS> needs_sync;
     std::array<bool, GGML_SCHED_MAX_BACKENDS> own_cpy;
@@ -1598,6 +1620,21 @@ struct ggml_backend_sched {
     bool is_async = false;
     bool debug;
     bool has_reduce = false;
+
+    struct worker_pool {
+        int n_backends = 0;
+        int cur_first_reduce = -1;
+        std::unique_ptr<std::barrier<>> barrier;
+        std::vector<std::thread> threads;
+        std::mutex mtx;
+        std::condition_variable cv_start;
+        std::condition_variable cv_done;
+        int epoch = 0;
+        int done_count = 0;
+        bool stop = false;
+        std::function<void(int, int)> compute_fn;
+    };
+    std::unique_ptr<worker_pool> pool;
 };
 
 void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op op, bool on_or_off) {
@@ -2615,7 +2652,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     if (sched->is_async && sched->n_backends > 2 && sched->split_mode_graph && sched->has_reduce) {
 
-        for (auto & s : sched->statuses) s = GGML_STATUS_SUCCESS;
+        for (auto & s : sched->statuses) s.status = GGML_STATUS_SUCCESS;
 
         int first_reduce = -1;
         bool work_done = false;
@@ -2683,7 +2720,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 if (ith == split_backend_id) {
 
-                    sched->statuses[ith] = ggml_backend_sched_eval(sched, split_backend, split);
+                    sched->statuses[ith].status = ggml_backend_sched_eval(sched, split_backend, split);
 
                     if (split->n_inputs > 0 && !sched->own_cpy[split_backend_id]) {
                         sched->needs_sync[split_backend_id] = true;
@@ -2723,10 +2760,49 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 #endif
         if (!work_done) {
 
-        std::barrier barrier(sched->n_backends);
-        auto compute = [sched, &barrier, first_reduce] (int ith) {
+        if (!sched->pool || sched->pool->n_backends != sched->n_backends) {
+            if (sched->pool) {
+                {
+                    std::lock_guard<std::mutex> lock(sched->pool->mtx);
+                    sched->pool->stop = true;
+                    sched->pool->cv_start.notify_all();
+                }
+                for (auto & t : sched->pool->threads) {
+                    if (t.joinable()) t.join();
+                }
+            }
+            sched->pool = std::make_unique<ggml_backend_sched::worker_pool>();
+            sched->pool->n_backends = sched->n_backends;
+            sched->pool->barrier = std::make_unique<std::barrier<>>(sched->n_backends);
+            for (int i = 1; i < sched->n_backends; ++i) {
+                sched->pool->threads.emplace_back([sched](int ith) {
+                    auto * p = sched->pool.get();
+                    int my_epoch = 0;
+                    while (true) {
+                        {
+                            std::unique_lock<std::mutex> lock(p->mtx);
+                            p->cv_start.wait(lock, [p, my_epoch] { return p->stop || p->epoch > my_epoch; });
+                            if (p->stop) break;
+                            my_epoch = p->epoch;
+                        }
 
+                        p->compute_fn(ith, p->cur_first_reduce);
+
+                        {
+                            std::lock_guard<std::mutex> lock(p->mtx);
+                            p->done_count++;
+                            if (p->done_count == p->n_backends - 1) {
+                                p->cv_done.notify_one();
+                            }
+                        }
+                    }
+                }, i);
+            }
+        }
+
+        auto compute = [sched] (int ith, int first_reduce) {
             struct ggml_backend_sched_split * splits = sched->splits;
+            auto & barrier = *sched->pool->barrier;
 
             std::vector<int32_t> ids;
             std::vector<uint32_t> unique_ids;
@@ -2758,7 +2834,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 if (ith == split_backend_id) {
 
-                    sched->statuses[ith] = ggml_backend_sched_eval(sched, split_backend, split);
+                    sched->statuses[ith].status = ggml_backend_sched_eval(sched, split_backend, split);
                     if (split->n_inputs > 0 && !sched->own_cpy[split_backend_id]) {
                         sched->needs_sync[split_backend_id] = true;
                     } else {
@@ -2783,26 +2859,37 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                     }
                 }
-                //if (needs_barrier) {
-                //    barrier.arrive_and_wait();
-                //}
 
                 // record the event of this copy
                 if (split->n_inputs > 0) {
                     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                        printf("Recording event %d, %d\n", split_backend_id, sched->cur_copy);
                         ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy]);
                     }
                 }
             }
         };
 
-        for (int i = 0; i < sched->n_backends; ++i) sched->workers.emplace_back(compute, i);
-        for (auto & w : sched->workers) w.join();
-        sched->workers.clear();
+        sched->pool->compute_fn = compute;
+        sched->pool->cur_first_reduce = first_reduce;
+
+        {
+            std::lock_guard<std::mutex> lock(sched->pool->mtx);
+            sched->pool->done_count = 0;
+            sched->pool->epoch++;
+            sched->pool->cv_start.notify_all();
         }
-        for (auto status : sched->statuses) {
-            if (status != GGML_STATUS_SUCCESS) return status;
+
+        compute(0, first_reduce);
+
+        {
+            std::unique_lock<std::mutex> lock(sched->pool->mtx);
+            sched->pool->cv_done.wait(lock, [sched] {
+                return sched->pool->done_count == sched->pool->n_backends - 1;
+            });
+        }
+        }
+        for (const auto & status : sched->statuses) {
+            if (status.status != GGML_STATUS_SUCCESS) return status.status;
         }
         return GGML_STATUS_SUCCESS;
 
@@ -2998,7 +3085,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
 
     sched->workers.reserve(sched->n_backends);
-    sched->statuses.resize(sched->n_backends, GGML_STATUS_SUCCESS);
+    sched->statuses.resize(sched->n_backends);
     sched->backend_splits.resize(sched->n_backends);
 
     ggml_backend_sched_reset(sched);
@@ -3009,6 +3096,17 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    if (sched->pool) {
+        {
+            std::lock_guard<std::mutex> lock(sched->pool->mtx);
+            sched->pool->stop = true;
+            sched->pool->cv_start.notify_all();
+        }
+        for (auto & t : sched->pool->threads) {
+            if (t.joinable()) t.join();
+        }
+        sched->pool.reset();
     }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {

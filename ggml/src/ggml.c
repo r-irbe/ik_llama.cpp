@@ -13,6 +13,7 @@
 #include "ggml.h"
 #include "ggml-aarch64.h"
 #include "ggml-moe-prefetch.h"
+#include "ggml-cpu-numa.h"
 #include "iqk/iqk_quantize.h"
 #include "iqk/iqk_cpu_ops.h"
 #if GGML_USE_IQK_MULMAT
@@ -29438,6 +29439,7 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
     cplan.n_threads = MIN(max_tasks, n_threads);
     cplan.work_size = work_size;
     cplan.work_data = NULL;
+    cplan.numa_node = -1;
 
     return cplan;
 }
@@ -29606,7 +29608,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     const struct ggml_cgraph * cgraph = state->shared->cgraph;
     const struct ggml_cplan  * cplan  = state->shared->cplan;
 
-    set_numa_thread_affinity(state->ith);
+    if (cplan->numa_node >= 0) {
+        ggml_cpu_numa_bind_current_thread(cplan->numa_node, state->ith);
+    } else {
+        set_numa_thread_affinity(state->ith);
+    }
 
     struct ggml_compute_params params = {
         /*.ith   =*/ state->ith,

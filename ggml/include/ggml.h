@@ -848,6 +848,9 @@ extern "C" {
 
         // read-ahead selected MoE expert weights in the CPU matmul-id kernels
         bool moe_expert_prefetch;
+
+        // target NUMA node for thread affinity (-1 = unset / default)
+        int numa_node;
     };
 
     enum ggml_cgraph_eval_order {
