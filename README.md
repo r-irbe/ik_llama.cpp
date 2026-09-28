@@ -2,6 +2,17 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
+>[!NOTE]
+>**NUMA Split Mode**:
+>Extends `ik_llama.cpp` with `--numa split` mode and CPU scheduling changes based on work by **Mike Chambers** ([@mikechambers84](https://github.com/mikechambers84)) in [`llama.cpp-ng`](https://github.com/mikechambers84/llama.cpp-ng).
+>
+>Changes in this fork:
+>- Ported node-local `mbind` allocation and pinned worker dispatch to the monolithic GGML backend.
+>- Fixed device indexing to support GPU offload alongside NUMA nodes (GPUs at `0..N-1`, NUMA nodes `CPU0`..`CPUn` at `N..`).
+>- Registered NUMA nodes in the backend registry so `-ot` tensor overrides can target specific nodes (e.g. routing MoE expert layers).
+>- Added `tests/test-numa.cpp` to verify sysfs topology parsing and page locality (`move_pages`).
+>- Added wide-row column slicing (`get_rows`), 64B destination cache-line snapping (`mul_mat`), and `GGML_CPU_PROFILE=1`.
+
 ## TL;DR
 
 This repository started as a fork of [llama.cpp](https://github.com/ggerganov/llama.cpp) in June of 2024 and was last synced with upstream in August of 2024. Compared to mainline `llama.cpp`, it offers additional SOTA quantization types and, in many cases, better performance. Various features related to LLM inference appeared here first before becoming available in llama.cpp. MLA, quant repacking, fused delta-net (known in `llama.cpp as "Gated Delta Net" - GDN), tensor parallel, MTP, DFlash, to just name a few.
