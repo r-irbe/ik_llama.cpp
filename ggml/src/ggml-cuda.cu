@@ -5529,6 +5529,31 @@ GGML_CALL void ggml_backend_cuda_get_device_memory(int device, size_t * free, si
     CUDA_CHECK(cudaMemGetInfo(free, total));
 }
 
+GGML_CALL int ggml_backend_cuda_get_device_numa_node(int device) {
+#if defined(__gnu_linux__)
+    char pci_bus_id[64] = {0};
+    cudaError_t err = cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), device);
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        return -1;
+    }
+    char path[128];
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/numa_node", pci_bus_id);
+    FILE * f = fopen(path, "r");
+    if (f) {
+        int node = -1;
+        if (fscanf(f, "%d", &node) == 1) {
+            fclose(f);
+            return node;
+        }
+        fclose(f);
+    }
+#else
+    GGML_UNUSED(device);
+#endif
+    return -1;
+}
+
 GGML_CALL bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
     if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
         return false;

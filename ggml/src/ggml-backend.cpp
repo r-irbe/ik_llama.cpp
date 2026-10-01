@@ -26,6 +26,9 @@
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
 #endif
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
 
 #define IK_PRINT_TIMING 0
 
@@ -2777,6 +2780,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             for (int i = 1; i < sched->n_backends; ++i) {
                 sched->pool->threads.emplace_back([sched](int ith) {
                     auto * p = sched->pool.get();
+                    if (ggml_backend_is_cpu_numa(sched->backends[ith])) {
+                        int node = ggml_backend_cpu_numa_get_node(sched->backends[ith]);
+                        ggml::cpu::numa::bind_current_thread_to_node(node, -1);
+                    }
+#ifdef GGML_USE_CUDA
+                    else if (ggml_backend_is_cuda(sched->backends[ith])) {
+                        int cuda_node = ggml_backend_cuda_get_device_numa_node(0);
+                        if (cuda_node >= 0) {
+                            ggml::cpu::numa::bind_current_thread_to_node(cuda_node, -1);
+                        }
+                    }
+#endif
                     int my_epoch = 0;
                     while (true) {
                         {
@@ -2877,6 +2892,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             sched->pool->done_count = 0;
             sched->pool->epoch++;
             sched->pool->cv_start.notify_all();
+        }
+
+        static thread_local bool s_thread0_bound = false;
+        if (!s_thread0_bound) {
+            if (ggml_backend_is_cpu_numa(sched->backends[0])) {
+                int node = ggml_backend_cpu_numa_get_node(sched->backends[0]);
+                ggml::cpu::numa::bind_current_thread_to_node(node, -1);
+            }
+#ifdef GGML_USE_CUDA
+            else if (ggml_backend_is_cuda(sched->backends[0])) {
+                int cuda_node = ggml_backend_cuda_get_device_numa_node(0);
+                if (cuda_node >= 0) {
+                    ggml::cpu::numa::bind_current_thread_to_node(cuda_node, -1);
+                }
+            }
+#endif
+            s_thread0_bound = true;
         }
 
         compute(0, first_reduce);

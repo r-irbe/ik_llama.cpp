@@ -98,7 +98,7 @@ static size_t parse_meminfo(const std::string & meminfo, const std::string & key
     return 0;
 }
 
-static int count_cores(const std::string & sysfs_root, const std::vector<int> & cpus) {
+static std::vector<int> get_physical_cores(const std::string & sysfs_root, const std::vector<int> & cpus) {
     std::vector<int> cores;
     cores.reserve(cpus.size());
 
@@ -116,7 +116,7 @@ static int count_cores(const std::string & sysfs_root, const std::vector<int> & 
     std::sort(cores.begin(), cores.end());
     cores.erase(std::unique(cores.begin(), cores.end()), cores.end());
 
-    return (int) cores.size();
+    return cores;
 }
 
 std::vector<node> parse_topology(const std::string & sysfs_root, const std::vector<int> & cpu_mask) {
@@ -157,7 +157,8 @@ std::vector<node> parse_topology(const std::string & sysfs_root, const std::vect
             continue;
         }
 
-        n.n_cores = count_cores(sysfs_root, n.cpus);
+        n.cores   = get_physical_cores(sysfs_root, n.cpus);
+        n.n_cores = (int) n.cores.size();
 
         nodes.push_back(std::move(n));
     }
@@ -450,13 +451,14 @@ bool bind_current_thread_to_node(int node_id, int thread_idx) {
             if (n.cpus.empty()) return false;
             cpu_set_t set;
             CPU_ZERO(&set);
+            const auto & cpu_targets = !n.cores.empty() ? n.cores : n.cpus;
             if (thread_idx >= 0) {
-                int target_cpu = n.cpus[thread_idx % n.cpus.size()];
+                int target_cpu = cpu_targets[thread_idx % cpu_targets.size()];
                 if (target_cpu >= 0 && target_cpu < CPU_SETSIZE) {
                     CPU_SET(target_cpu, &set);
                 }
             } else {
-                for (int cpu : n.cpus) {
+                for (int cpu : cpu_targets) {
                     if (cpu >= 0 && cpu < CPU_SETSIZE) {
                         CPU_SET(cpu, &set);
                     }

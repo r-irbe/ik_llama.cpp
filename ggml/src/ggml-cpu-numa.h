@@ -14,6 +14,7 @@ struct node {
     int id = -1;
 
     std::vector<int> cpus;        // usable logical CPUs, after the process affinity mask
+    std::vector<int> cores;       // usable physical core primary CPUs (excluding SMT siblings)
     int              n_cores = 0; // usable physical cores
 
     size_t mem_total     = 0;

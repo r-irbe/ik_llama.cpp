@@ -2607,6 +2607,8 @@ static void llama_kv_cache_clear(struct llama_kv_cache & cache) {
     for (int32_t i = 0; i < (int32_t) cache.size; ++i) {
         cache.cells[i].pos = -1;
         cache.cells[i].src = i;
+        cache.cells[i].tok = -1;
+        cache.cells[i].delta = 0;
         cache.cells[i].seq_id.clear();
     }
     cache.head = 0;
@@ -2698,6 +2700,8 @@ static bool llama_kv_cache_seq_rm(
                 if (cache.cells[i].pos >= 0) cache.used--;
 
                 cache.cells[i].pos = -1;
+                cache.cells[i].tok = -1;
+                cache.cells[i].delta = 0;
                 if (has_qnext_state) {
                     cache.cells[i].src = i;
                 }
@@ -2715,6 +2719,12 @@ static bool llama_kv_cache_seq_rm(
         if (seq_id >= 0 && (size_t) seq_id < cache.heads_swa.size()) {
             cache.heads_swa[seq_id]     = compact_head;
             cache.pos_bases_swa[seq_id] = compact_base;
+        }
+    }
+
+    if (cache.used == 0) {
+        for (auto & buf : cache.bufs) {
+            ggml_backend_buffer_clear(buf, 0);
         }
     }
 
