@@ -605,6 +605,8 @@ extern "C" {
     //optional:
     LLAMA_API enum llama_numa_init_status llama_numa_init_ex(enum ggml_numa_strategy numa);
     LLAMA_API void llama_numa_init(enum ggml_numa_strategy numa);
+    LLAMA_API bool llama_numa_bind_current_thread(int node_id, int thread_idx);
+    LLAMA_API int  llama_numa_node_count(void);
 
     // Call once at the end of the program - currently only used for MPI
     LLAMA_API void llama_backend_free(void);

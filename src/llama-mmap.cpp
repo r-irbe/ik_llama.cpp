@@ -12,6 +12,9 @@
 #include <algorithm>
 #include <fstream>
 #include <sstream>
+#include <thread>
+#include <atomic>
+#include <mutex>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -306,12 +309,39 @@ struct llama_mmap::impl {
             if (addr != MAP_FAILED) {
                 printf("%s: using THP with page size %zu MiB ", __func__, huge/(1024*1024));
                 fflush(stdout);
-                size_t tot = 0;
-                while (tot < file->size()) {
-                    auto n_read = pread(fd, static_cast<char*>(addr) + tot, file->size() - tot, tot);
-                    if (n_read < 0) throw std::runtime_error(format("Reading into mapped huge pages failed at %zu (%s)", tot, strerror(errno)));
-                    printf(".");  fflush(stdout);
-                    tot += n_read;
+                const size_t file_size = file->size();
+                constexpr size_t CHUNK_SIZE = 16 * 1024 * 1024; // 16 MB chunks
+                const size_t n_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+                const int n_threads = std::min<int>(32, std::max<int>(4, (int)std::thread::hardware_concurrency() / 2));
+                std::atomic<size_t> chunk_idx{0};
+                std::atomic<bool> read_failed{false};
+                std::string read_error;
+                std::mutex err_mutex;
+
+                std::vector<std::thread> workers;
+                workers.reserve(n_threads);
+                for (int t = 0; t < n_threads; ++t) {
+                    workers.emplace_back([&]() {
+                        while (!read_failed.load(std::memory_order_relaxed)) {
+                            size_t c = chunk_idx.fetch_add(1, std::memory_order_relaxed);
+                            if (c >= n_chunks) break;
+                            size_t off = c * CHUNK_SIZE;
+                            size_t len = std::min(CHUNK_SIZE, file_size - off);
+                            ssize_t n = pread(fd, static_cast<char*>(addr) + off, len, off);
+                            if (n != (ssize_t)len) {
+                                std::lock_guard<std::mutex> lock(err_mutex);
+                                read_failed.store(true, std::memory_order_relaxed);
+                                read_error = format("Reading into mapped huge pages failed at %zu (%s)", off, strerror(errno));
+                                break;
+                            }
+                        }
+                    });
+                }
+                for (auto & w : workers) {
+                    if (w.joinable()) w.join();
+                }
+                if (read_failed.load()) {
+                    throw std::runtime_error(read_error);
                 }
                 printf(" done\n");
                 mapped_fragments.emplace_back(0, file->size());

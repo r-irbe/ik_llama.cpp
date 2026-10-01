@@ -8795,6 +8795,14 @@ void llama_numa_init(enum ggml_numa_strategy numa) {
     }
 }
 
+bool llama_numa_bind_current_thread(int node_id, int thread_idx) {
+    return ggml::cpu::numa::bind_current_thread_to_node(node_id, thread_idx);
+}
+
+int llama_numa_node_count(void) {
+    return (int) ggml::cpu::numa::topology().size();
+}
+
 void llama_backend_free(void) {
     ggml_quantize_free();
 }

@@ -2,6 +2,8 @@
 
 #if defined(__linux__)
 
+#include "ggml-cpu-numa.h"
+
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -105,7 +107,15 @@ struct prefetch_pool {
         shutdown = false;
         workers.reserve(n_threads);
         for (int i = 0; i < n_threads; ++i) {
-            workers.emplace_back([this] { run(); });
+            workers.emplace_back([this, i] {
+                if (ggml::cpu::numa::is_numa_split()) {
+                    // Node 2 hosts the 4x Lexar NM790 NVMe RAID0 PCIe carrier card.
+                    // Binding prefetch threads to Node 2 ensures madvise(MADV_POPULATE_READ)
+                    // page faults allocate memory on local DDR4 channels, avoiding xGMI hops.
+                    ggml::cpu::numa::bind_current_thread_to_node(2, i);
+                }
+                run();
+            });
         }
     }
 

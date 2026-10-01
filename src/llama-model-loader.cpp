@@ -1140,7 +1140,8 @@ bool llama_model_loader::load_all_data(
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
     // Number of worker threads for cuda and host tensor loading.
-    const int n_workers = 8;
+    // Scales dynamically with available cores (up to 32) to drive queue depth across NVMe RAID0 arrays.
+    const int n_workers = std::min(32, std::max(8, (int)std::thread::hardware_concurrency() / 2));
 
     std::vector<std::vector<no_init<uint8_t>>> read_bufs(n_workers);
 

@@ -2301,6 +2301,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.speculative.devices = parse_device_list(value);
         return true;
     }
+    if (arg == "-nnd" || arg == "--numa-node-draft") {
+        CHECK_ARG
+        params.speculative.numa_node = std::stoi(argv[i]);
+        return true;
+    }
     if (arg == "-v" || arg == "--verbose") {
         params.verbosity = 1;
         return true;
@@ -3362,6 +3367,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
         options.push_back({ "*",           "-devd,   --device-draft dev1,dev2",
                                                                          "comma-separated list of devices to use for offloading for the draft model (none = don't offload)\n"
                                                                          "Example: CUDA0,CUDA1,RPC[192.168.0.1:8080]\n" });
+        options.push_back({ "*",           "-nnd,   --numa-node-draft N", "NUMA node affinity for draft model (default: -1 for auto/socket-asymmetric)" });
         options.push_back({ "*",           "-op,   --offload-policy POLICY","set per-layer offload policy as layer_id,0|1 pairs, comma-separated" });
         options.push_back({ "*",           "-no-ooae, --no-offload-only-active-experts",
                                                                          "do not offload only active experts" });

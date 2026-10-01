@@ -263,6 +263,8 @@ struct common_params_speculative {
 
     bool autotune = false; // automatically optimize speculative params for max tokens/sec
 
+    int32_t numa_node = -1; // NUMA node affinity for draft model (-1: auto/socket-asymmetric, >=0: explicit node)
+
     bool has_dft() const {
         return !model.empty() || !params.empty();
         //return !mparams_dft.path.empty() || !mparams_dft.hf_repo.empty();

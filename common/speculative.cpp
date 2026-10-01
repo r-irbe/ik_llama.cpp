@@ -21,6 +21,10 @@
 #include <sstream>
 #include <unordered_map>
 
+#if defined(__linux__)
+#include <sched.h>
+#endif
+
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
@@ -1611,6 +1615,39 @@ llama_tokens common_speculative_draft(
     if (spec->tuner && spec->tuner->enabled) {
         spec->tuner->propose(params);
     }
+
+    // Socket-asymmetric NUMA affinity binding for speculative drafting:
+    // If numa_node is set (or automatically on multi-NUMA topologies where node count >= 4),
+    // bind draft execution to Socket 1 (Node >= 4) so draft model forward passes never compete
+    // with the target model or RTX 4090 PCIe bus on Socket 0.
+    int target_draft_node = params.numa_node;
+    if (target_draft_node < 0 && llama_numa_node_count() >= 4) {
+        target_draft_node = llama_numa_node_count() / 2;
+    }
+
+#if defined(__linux__)
+    struct scoped_draft_affinity {
+        cpu_set_t prev;
+        bool active = false;
+
+        scoped_draft_affinity(int target_node) {
+            if (target_node >= 0) {
+                CPU_ZERO(&prev);
+                if (sched_getaffinity(0, sizeof(prev), &prev) == 0) {
+                    if (llama_numa_bind_current_thread(target_node, -1)) {
+                        active = true;
+                    }
+                }
+            }
+        }
+
+        ~scoped_draft_affinity() {
+            if (active) {
+                sched_setaffinity(0, sizeof(prev), &prev);
+            }
+        }
+    } affinity_guard(target_draft_node);
+#endif
 
     const auto runtime_stages = params.get_resolved_stages();
     const bool use_runtime_stage_overrides = common_speculative_stage_chain_matches(runtime_stages, spec->configs);
